@@ -14,6 +14,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.shadow
@@ -25,27 +26,46 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
-import com.example.gitara.metronome.MetronomeManager
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.gitara.data.DataStoreManager
+import com.example.gitara.metronome.MetronomeManager
 import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MetronomeScreen(onBackClick: () -> Unit = {}) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
 
     // Читаем настройку вибрации
     val dataStoreManager = remember { DataStoreManager(context) }
     val vibrationEnabled by dataStoreManager.metronomeVibration.collectAsState(initial = false)
 
-    var bpm by remember { mutableFloatStateOf(100f) }
+    var bpm by rememberSaveable { mutableFloatStateOf(100f) }
     var isRunning by remember { mutableStateOf(false) }
-    var beatsPerBar by remember { mutableIntStateOf(4) }
+    var beatsPerBar by rememberSaveable { mutableIntStateOf(4) }
     var currentBeat by remember { mutableIntStateOf(0) }
     var showBpmDialog by remember { mutableStateOf(false) }
 
     val metronome = remember {
         MetronomeManager.create(context) { beat -> currentBeat = beat }
+    }
+
+    // Автоматическая остановка метронома при уходе приложения в фон или со экрана
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) {
+                isRunning = false
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            metronome.stop()
+            MetronomeManager.stop()
+        }
     }
 
     // Передаем настройку в метроном
@@ -80,7 +100,6 @@ fun MetronomeScreen(onBackClick: () -> Unit = {}) {
             CenterAlignedTopAppBar(
                 title = { Text("МЕТРОНОМ", letterSpacing = 2.sp, fontWeight = FontWeight.Bold) },
                 navigationIcon = {
-                    // 🔥 ОБНОВЛЕННАЯ КНОПКА НАЗАД (КАК В ПЕСНЯХ)
                     FilledIconButton(
                         onClick = onBackClick,
                         colors = IconButtonDefaults.filledIconButtonColors(
@@ -193,7 +212,7 @@ fun MetronomeScreen(onBackClick: () -> Unit = {}) {
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // 5. Кнопка СТАРТ
+            // 5. Кнопка СТАРТ / СТОП
             Button(
                 onClick = { isRunning = !isRunning },
                 modifier = Modifier

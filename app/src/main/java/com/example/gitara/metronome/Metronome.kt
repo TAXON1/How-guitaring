@@ -4,91 +4,139 @@ import android.content.Context
 import android.media.AudioAttributes
 import android.media.SoundPool
 import android.os.Build
-import android.os.Vibrator
 import android.os.VibrationEffect
+import android.os.Vibrator
 import androidx.core.content.getSystemService
 import com.example.gitara.R
 import kotlinx.coroutines.*
-import kotlin.math.roundToInt
 
 class Metronome(
     private val context: Context,
     private val onBeat: (Int) -> Unit
 ) {
     private var job: Job? = null
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private var scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     // Свойство для управления вибрацией (меняется на лету)
     var isVibrationEnabled: Boolean = false
 
-    private val soundPool: SoundPool = SoundPool.Builder()
-        .setMaxStreams(10)
-        .setAudioAttributes(
-            AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_MEDIA)
-                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                .build()
-        )
-        .build()
-
+    private var soundPool: SoundPool? = null
     private var tickSoundId: Int = 0
     private var accentSoundId: Int = 0
-    private val vibrator: Vibrator? = context.getSystemService()
+    @Volatile
+    private var isSoundPoolLoaded = false
+    private var isReleased = false
+
+    private val vibrator: Vibrator? by lazy {
+        context.applicationContext.getSystemService()
+    }
 
     init {
-        // Убедитесь, что файлы raw существуют
-        tickSoundId = soundPool.load(context, R.raw.metronome_tick, 1)
-        accentSoundId = soundPool.load(context, R.raw.metronome_accent, 1)
+        initSoundPool()
+    }
+
+    @Synchronized
+    private fun initSoundPool() {
+        if (soundPool != null) return
+
+        val sp = SoundPool.Builder()
+            .setMaxStreams(10)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build()
+            )
+            .build()
+
+        val loadedIds = mutableSetOf<Int>()
+        sp.setOnLoadCompleteListener { _, sampleId, status ->
+            if (status == 0) {
+                loadedIds.add(sampleId)
+                if (tickSoundId != 0 && accentSoundId != 0 &&
+                    loadedIds.contains(tickSoundId) && loadedIds.contains(accentSoundId)
+                ) {
+                    isSoundPoolLoaded = true
+                }
+            }
+        }
+
+        tickSoundId = sp.load(context.applicationContext, R.raw.metronome_tick, 1)
+        accentSoundId = sp.load(context.applicationContext, R.raw.metronome_accent, 1)
+        soundPool = sp
+    }
+
+    @Synchronized
+    private fun ensureActive() {
+        if (isReleased || !scope.isActive) {
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+            isReleased = false
+        }
+        if (soundPool == null) {
+            initSoundPool()
+        }
     }
 
     fun start(bpm: Int, beatsPerBar: Int) {
         stop()
-        if (bpm <= 0) return
+        if (bpm <= 0 || beatsPerBar <= 0) return
+
+        ensureActive()
 
         job = scope.launch {
-            val intervalMs = 60_000 / bpm.toDouble()
+            val intervalMs = 60_000.0 / bpm
             var beatIndex = 0
-            var nextTime = System.currentTimeMillis()
+            var startTime = System.currentTimeMillis()
 
             while (isActive) {
+                val targetTime = startTime + (beatIndex * intervalMs).toLong()
                 val now = System.currentTimeMillis()
-                val delayTime = nextTime - now
+
+                // Если произошла существенная задержка (больше 2 интервалов), подстраиваем отсчет
+                if (now - targetTime > intervalMs * 2) {
+                    startTime = now - (beatIndex * intervalMs).toLong()
+                }
+
+                val delayTime = targetTime - now
 
                 if (delayTime <= 0) {
-                    val isAccent = beatIndex % beatsPerBar == 0
+                    val currentBeatIndex = beatIndex % beatsPerBar
+                    val isAccent = currentBeatIndex == 0
                     val soundId = if (isAccent) accentSoundId else tickSoundId
 
-                    // 🔥 МАКСИМАЛЬНАЯ ГРОМКОСТЬ
-                    val volume = 2.0f
+                    // 1. Воспроизведение звука в фоновом потоке без задержек
+                    if (soundId != 0) {
+                        val priority = if (isAccent) 2 else 1
+                        soundPool?.play(soundId, 1.0f, 1.0f, priority, 0, 1f)
+                    }
 
-                    // Звук
-                    soundPool.play(soundId, volume, volume, 1, 0, 1f)
-
-                    // ВИБРАЦИЯ (Только если включена)
+                    // 2. Вибрация
                     if (isVibrationEnabled) {
-                        vibrator?.let { vib ->
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                                // Короткий четкий удар
-                                val effect = if (isAccent)
-                                    VibrationEffect.createOneShot(80, VibrationEffect.DEFAULT_AMPLITUDE)
-                                else
-                                    VibrationEffect.createOneShot(40, VibrationEffect.DEFAULT_AMPLITUDE)
-                                vib.vibrate(effect)
-                            } else {
-                                @Suppress("DEPRECATION")
-                                vib.vibrate(if (isAccent) 80 else 40)
+                        try {
+                            vibrator?.let { vib ->
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                    val effect = if (isAccent)
+                                        VibrationEffect.createOneShot(80, VibrationEffect.DEFAULT_AMPLITUDE)
+                                    else
+                                        VibrationEffect.createOneShot(40, VibrationEffect.DEFAULT_AMPLITUDE)
+                                    vib.vibrate(effect)
+                                } else {
+                                    @Suppress("DEPRECATION")
+                                    vib.vibrate(if (isAccent) 80L else 40L)
+                                }
                             }
+                        } catch (_: Exception) {
                         }
                     }
 
-                    withContext(Dispatchers.Main) {
-                        onBeat(beatIndex % beatsPerBar)
+                    // 3. Асинхронный вызов обновления UI (не блокирует аудио-поток)
+                    scope.launch(Dispatchers.Main) {
+                        onBeat(currentBeatIndex)
                     }
 
                     beatIndex++
-                    nextTime += intervalMs.roundToInt()
                 } else {
-                    delay(delayTime.coerceAtMost(20))
+                    delay(delayTime.coerceAtMost(10))
                 }
             }
         }
@@ -99,9 +147,16 @@ class Metronome(
         job = null
     }
 
+    @Synchronized
     fun release() {
         stop()
-        soundPool.release()
+        isReleased = true
+        try {
+            soundPool?.release()
+        } catch (_: Exception) {
+        }
+        soundPool = null
+        isSoundPoolLoaded = false
         scope.cancel()
     }
 }
